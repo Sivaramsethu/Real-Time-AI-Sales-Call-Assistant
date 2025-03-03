@@ -1,200 +1,182 @@
-import webrtc_streamer, WebRtcMode, AudioProcessorBase
-from sentiment_analysis import analyze_sentiment, transcribe_with_chunks
-from product_recommender import ProductRecommender
-from objection_handler import ObjectionHandler
-from google_sheets import fetch_call_data, store_data_in_sheet
-from sentence_transformers import SentenceTransformer
-import re
-import uuid
-import pandas as pd
-import plotly.express as px
 import streamlit as st
-import numpy as np
-import queue
-import threading
+import pandas as pd
+import speech_recognition as sr
+from textblob import TextBlob
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+import plotly.express as px
 
-# Initialize components
-objection_handler = ObjectionHandler("objections.csv")
-product_recommender = ProductRecommender("recommendations.csv")
-model = SentenceTransformer('all-MiniLM-L6-v2')
+# Set up Google Sheets credentials with google-auth
+SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+CREDENTIALS = Credentials.from_service_account_file(
+    'ai-sales-call-assistant-447217-d083604834bf.json', scopes=SCOPE
+)
+gc = gspread.authorize(CREDENTIALS)
 
-# Queue to hold transcribed text
-transcription_queue = queue.Queue()
+# Connect to Google Sheets
+sheet = gc.open("Real-Time Speech Analysis").sheet1  # Replace with your Google Sheets name
 
-def generate_comprehensive_summary(chunks):
-    # Your existing function implementation
-    pass
+# Cache function for fetching data from Google Sheets
+@st.cache
+def get_sheet_data():
+    data = pd.DataFrame(sheet.get_all_records())
+    return data
 
-def is_valid_input(text):
-    # Your existing function implementation
-    pass
+# Groq API configuration
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = "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"
 
-def is_relevant_sentiment(sentiment_score):
-    # Your existing function implementation
-    pass
+# Load CRM data from file
+CRM_DATA_PATH = "D:/Real-Time AI/laptop_data.csv"
+crm_data = pd.read_csv(CRM_DATA_PATH)
 
-def calculate_overall_sentiment(sentiment_scores):
-    # Your existing function implementation
-    pass
+# Sentiment analysis using TextBlob
+def analyze_sentiment(text):
+    analysis = TextBlob(text)
+    polarity = analysis.sentiment.polarity
+    if polarity > 0:
+        sentiment = "Positive"
+    elif polarity < 0:
+        sentiment = "Negative"
+    else:
+        sentiment = "Neutral"
+    return sentiment, round(polarity, 2)
 
-def handle_objection(text):
-    query_embedding = model.encode([text])
-    distances, indices = objection_handler.index.search(query_embedding, 1)
-    if distances[0][0] < 1.5:
-        responses = objection_handler.handle_objection(text)
-        return "\n".join(responses) if responses else "No objection response found."
-    return "No objection response found."
-
-class AudioProcessor(AudioProcessorBase):
-    def _init_(self):
-        self.sr = 16000  # Sample rate
-        self.q = transcription_queue
-
-    def recv(self, frame):
-        audio_data = frame.to_ndarray()
-        audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()  # Convert to int16 format
-        
-        print(f"Audio data shape: {audio_data.shape}")
-        print(f"Audio data sample: {audio_data[:10]}")
-        
-        text = self.transcribe_audio(audio_bytes)
-        if text:
-            self.q.put(text)
-
-        return frame
-
-    def transcribe_audio(self, audio_bytes):
+# Process audio to text using SpeechRecognition
+def process_audio_to_text():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
         try:
-            chunks = transcribe_with_chunks({})
-            if chunks:
-                return chunks[-1][0]
-        except Exception as e:
-            print(f"Error transcribing audio: {e}")
-        return None
+            audio = recognizer.listen(source, timeout=10)
+            text = recognizer.recognize_google(audio)
+            return text
+        except sr.UnknownValueError:
+            return ""
+        except sr.RequestError:
+            return ""
+        except sr.WaitTimeoutError:
+            return ""
 
-def real_time_analysis():
-    st.info("Listening... Say 'stop' to end the process.")
+# Query Groq API for product recommendations
+def query_groq(prompt):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+    }
+    response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=10)
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"]
+    else:
+        st.error(f"Groq API Error: {response.status_code} - {response.text}")
+        return "No information available"
 
-    webrtc_ctx = webrtc_streamer(
-        key="real-time-audio",
-        mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=AudioProcessor,
-        media_stream_constraints={"audio": True, "video": False},
-    )
+# Recommend products based on user query
+def recommend_products(query):
+    recommendations = []
+    if "price of" in query.lower():
+        product_name = query.lower().replace("what is the price of", "").strip()
+        match = crm_data[crm_data['Model'].str.lower() == product_name]
+        if not match.empty:
+            product = match.iloc[0]
+            recommendations.append(f"The price of {product['Model']} is ₹{product['Price']}.")
+    elif "gaming laptop under" in query.lower():
+        price_limit = int(''.join(filter(str.isdigit, query)))
+        matches = crm_data[(crm_data['Category'].str.lower() == "gaming") & (crm_data['Price'] <= price_limit)]
+        if not matches.empty:
+            recommendations = [f"{row['Model']} for ₹{row['Price']}" for _, row in matches.iterrows()]
+    elif "should i buy" in query.lower():
+        product_name = query.lower().replace("should i buy", "").strip()
+        match = crm_data[crm_data['Model'].str.lower() == product_name]
+        if not match.empty and match.iloc[0]['Category'].lower() != "gaming":
+            alternatives = crm_data[crm_data['Category'].str.lower() == "gaming"]
+            alt_recommendations = [f"{row['Model']} for ₹{row['Price']}" for _, row in alternatives.iterrows()]
+            recommendations.append(f"{product_name} is not ideal for gaming. Consider: " + ", ".join(alt_recommendations))
+    else:
+        prompt = f"Based on the query: {query}, suggest relevant products."
+        response = query_groq(prompt)
+        recommendations.append(response)
 
-    if webrtc_ctx.state.playing:
-        while not transcription_queue.empty():
-            text = transcription_queue.get()
-            st.write(f"Recognized Text: {text}")
+    if recommendations:
+        short_summary = "Here are some suggestions: " + ", ".join(recommendations[:2])
+        return short_summary, recommendations[0]
+    return "Sorry, I couldn't find any recommendations.", "No information available"
 
-            sentiment, score = analyze_sentiment(text)
-            st.write(f"Sentiment: {sentiment} (Score: {score})")
+# Handle customer objections
+def handle_objections(user_input):
+    objections = {
+        "too expensive": "We understand budget is important. Would you like to explore more affordable options?",
+        "better deal": "Let me help you find the best deal available. Are you open to refurbished models?",
+        "not sure about the specs": "Could you share more about your needs? I can recommend the right specs for you.",
+    }
+    for key, response in objections.items():
+        if key in user_input.lower():
+            return response
+    return "I understand your concern. Can you tell me more about your hesitation?"
 
-            objection_response = handle_objection(text)
-            st.write(f"Objection Response: {objection_response}")
+# Generate dynamic follow-up questions
+def generate_questions(user_input):
+    prompt = f"Based on the user input: {user_input}, generate a dynamic follow-up question to guide the sales process."
+    response = query_groq(prompt)
+    return response
 
-            recommendations = []
-            if is_valid_input(text) and is_relevant_sentiment(score):
-                query_embedding = model.encode([text])
-                distances, indices = product_recommender.index.search(query_embedding, 1)
-
-                if distances[0][0] < 1.5:
-                    recommendations = product_recommender.get_recommendations(text)
-
-            if recommendations:
-                st.write("Product Recommendations:")
-                for rec in recommendations:
-                    st.write(rec)
-
-def fetch_data_and_display():
+# Store query data in Google Sheets
+def store_data_in_sheets(user_input, sentiment, score, recommendation, objection, dqg_response):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        st.header("Call Summaries and Sentiment Analysis")
-        data = fetch_call_data("Real-Time Speech Analysis")  # Updated Google Sheet Name
-        
-        print(f"Fetched data: {data}")  # Log fetched data
-        
-        if data.empty:
-            st.warning("No data available in the Google Sheet.")
-        else:
-            sentiment_counts = data['Sentiment'].value_counts()
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Sentiment Distribution")
-                fig_pie = px.pie(
-                    values=sentiment_counts.values, 
-                    names=sentiment_counts.index, 
-                    title='Call Sentiment Breakdown',
-                    color_discrete_map={
-                        'POSITIVE': 'green', 
-                        'NEGATIVE': 'red', 
-                        'NEUTRAL': 'blue'
-                    }
-                )
-                st.plotly_chart(fig_pie)
-
-            with col2:
-                st.subheader("Sentiment Counts")
-                fig_bar = px.bar(
-                    x=sentiment_counts.index, 
-                    y=sentiment_counts.values, 
-                    title='Number of Calls by Sentiment',
-                    labels={'x': 'Sentiment', 'y': 'Number of Calls'},
-                    color=sentiment_counts.index,
-                    color_discrete_map={
-                        'POSITIVE': 'green', 
-                        'NEGATIVE': 'red', 
-                        'NEUTRAL': 'blue'
-                    }
-                )
-                st.plotly_chart(fig_bar)
-
-            st.subheader("All Calls")
-            display_data = data.copy()
-            display_data['Summary Preview'] = display_data['Summary'].str[:100] + '...'
-            st.dataframe(display_data[['Call ID', 'Chunk', 'Sentiment', 'Summary Preview', 'Overall Sentiment']])
-
-            unique_call_ids = data[data['Call ID'] != '']['Call ID'].unique()
-            call_id = st.selectbox("Select a Call ID to view details:", unique_call_ids)
-
-            call_details = data[data['Call ID'] == call_id]
-            if not call_details.empty:
-                st.subheader("Detailed Call Information")
-                st.write(f"*Call ID:* {call_id}")
-                st.write(f"*Overall Sentiment:* {call_details.iloc[0]['Overall Sentiment']}")
-
-                st.subheader("Full Call Summary")
-                st.text_area("Summary:", 
-                             value=call_details.iloc[0]['Summary'], 
-                             height=200, 
-                             disabled=True)
-
-                st.subheader("Conversation Chunks")
-                for _, row in call_details.iterrows():
-                    if pd.notna(row['Chunk']):  
-                        st.write(f"*Chunk:* {row['Chunk']}")
-                        st.write(f"*Sentiment:* {row['Sentiment']}")
-                        st.write("---")
-            else:
-                st.error("No details available for the selected Call ID.")
+        sheet.append_row([timestamp, user_input, sentiment, score, recommendation, objection, dqg_response])
+        st.info("Data successfully logged into Google Sheets.")
     except Exception as e:
-        st.error(f"Error loading dashboard: {e}")
+        st.error(f"Failed to store data in Google Sheets: {e}")
 
-def run_app():
-    st.set_page_config(page_title="Sales Call Assistant", layout="wide")
-    st.title("AI Sales Call Assistant")
+# Streamlit Interface
+st.title("Real-Time Sales Call Assistant")
 
-    st.sidebar.title("Navigation")
-    app_mode = st.sidebar.radio("Choose a mode:", ["Real-Time Call Analysis", "Dashboard"])
+menu = ["Query Analysis", "Dashboard"]
+selection = st.sidebar.selectbox("Choose an option", menu)
 
-    if app_mode == "Real-Time Call Analysis":
-        st.header("Real-Time Sales Call Analysis")
-        if st.button("Start Listening"):
-            real_time_analysis()
+if selection == "Query Analysis":
+    if "running" not in st.session_state:
+        st.session_state.running = False
 
-    elif app_mode == "Dashboard":
-        st.header("Call Summaries and Sentiment Analysis")
-        fetch_data_and_display()
+    if st.button("Start Listening"):
+        st.session_state.running = True
+        st.info("Listening...")
 
-if _name_ == "_main_":
-    run_app()
+    while st.session_state.running:
+        user_input = process_audio_to_text()
+        if user_input:
+            if "stop" in user_input.lower():
+                st.session_state.running = False
+                st.info("Stopping real-time analysis.")
+            else:
+                sentiment, score = analyze_sentiment(user_input)
+                st.write(f"Transcript: {user_input}")
+                st.write(f"Sentiment: {sentiment} (Score: {score})")
+                
+                recommendation, summary = recommend_products(user_input)
+                objection = handle_objections(user_input)
+                dqg_response = generate_questions(user_input)
+                
+                st.write(f"Recommendation: {recommendation}")
+                st.write(f"Objection Handling: {objection}")
+                st.write(f"Dynamic Question: {dqg_response}")
+                
+                store_data_in_sheets(user_input, sentiment, score, recommendation, objection, dqg_response)
+
+elif selection == "Dashboard":
+    st.subheader("Post-Call Summary")
+    with st.spinner("Loading data..."):
+        data = get_sheet_data()
+
+    if st.button("Show Enhanced Dashboard"):
+        sentiment_counts = data['Sentiment'].value_counts()
+        sentiment_fig = px.pie(sentiment_counts, names=sentiment_counts.index, values=sentiment_counts.values,
+                                title="Sentiment Distribution")
+        st.plotly_chart(sentiment_fig)
